@@ -1,7 +1,7 @@
 export default async function handler(req, res) {
   // 1. Define your data sources
   // Replace this with the actual URL of your public JSON report from Koha
-  const KOHA_JSON_URL = "https://your-koha-catalog.com/cgi-bin/koha/svc/report?id=YOUR_REPORT_ID"; 
+  const KOHA_JSON_URL = "https://mckinney.bywatersolutions.com/cgi-bin/koha/svc/report?id=1166"; 
   
   try {
     // 2. Fetch the owned ISBNs from Koha
