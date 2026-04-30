@@ -2,6 +2,7 @@
   "name": "mckinney-gap-analyzer",
   "version": "1.0.0",
   "description": "Library collection gap analysis tool",
+  "type": "module",
   "main": "api/analyzer.js",
   "scripts": {
     "start": "node api/analyzer.js"
