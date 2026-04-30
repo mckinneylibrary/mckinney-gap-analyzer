@@ -4,10 +4,7 @@ export default async function handler(req, res) {
   
   try {
     const kohaResponse = await fetch(KOHA_JSON_URL);
-    
-    if (!kohaResponse.ok) {
-        return res.status(500).json({ error: `Failed to reach Koha. Status: ${kohaResponse.status}` });
-    }
+    if (!kohaResponse.ok) return res.status(500).json({ error: `Failed to reach Koha.` });
 
     const kohaData = await kohaResponse.json();
     
@@ -23,55 +20,63 @@ export default async function handler(req, res) {
       return res.status(200).send("<h1>No ISBNs found in Koha report. Check the collection code.</h1>");
     }
 
-    const testIsbn = ownedIsbns[0];
-    const googleBookRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${testIsbn}`);
-    const googleBookData = await googleBookRes.json();
-
-    if (!googleBookData.items || googleBookData.items.length === 0) {
-      return res.status(404).send(`<h1>Book not found in Google Books API for test ISBN: ${testIsbn}</h1>`);
-    }
-
-    const bookInfo = googleBookData.items[0].volumeInfo;
-    const author = bookInfo.authors ? bookInfo.authors[0] : "";
+    // --- THE UPGRADE: Batch Processing ---
+    // We will check the first 5 ISBNs to stay under Vercel's 10-second timeout.
+    // You can cautiously increase this number, but if you hit a 504 error, lower it back down.
+    const batchToProcess = ownedIsbns.slice(0, 5); 
     
-    if (!author) {
-        return res.status(404).send("<h1>No author found for the test ISBN.</h1>");
+    const missingBooksMaster = [];
+    const analyzedAuthors = new Set(); // Keeps track of authors we've already checked so we don't repeat work
+
+    for (const currentIsbn of batchToProcess) {
+        // 1. Identify the Author
+        const googleBookRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${currentIsbn}`);
+        const googleBookData = await googleBookRes.json();
+
+        if (!googleBookData.items || googleBookData.items.length === 0) continue; // Skip if book not found
+
+        const author = googleBookData.items[0].volumeInfo.authors ? googleBookData.items[0].volumeInfo.authors[0] : "";
+        
+        // If we have no author, or we've already analyzed this author, skip to the next ISBN
+        if (!author || analyzedAuthors.has(author)) continue;
+        
+        analyzedAuthors.add(author);
+
+        // 2. Search for the Author's complete works
+        const seriesRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=inauthor:"${author}"&maxResults=40`);
+        const seriesData = await seriesRes.json();
+
+        const seriesTitles = seriesData.items ? seriesData.items.map(item => item.volumeInfo) : [];
+
+        // 3. Gap Analysis for this specific Author
+        for (const book of seriesTitles) {
+            const bookIsbns = book.industryIdentifiers 
+                ? book.industryIdentifiers.map(id => id.identifier) 
+                : [];
+            
+            const isOwned = bookIsbns.some(isbn => ownedIsbns.includes(isbn));
+
+            if (!isOwned && book.title) {
+                missingBooksMaster.push({
+                    author: author,
+                    title: book.title,
+                    publishedDate: book.publishedDate || "Unknown",
+                    isbns: bookIsbns.join(', ')
+                });
+            }
+        }
     }
 
-    const seriesRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=inauthor:"${author}"&maxResults=40`);
-    const seriesData = await seriesRes.json();
-
-    const missingBooks = [];
-    const seriesTitles = seriesData.items ? seriesData.items.map(item => item.volumeInfo) : [];
-
-    for (const book of seriesTitles) {
-      const bookIsbns = book.industryIdentifiers 
-        ? book.industryIdentifiers.map(id => id.identifier) 
-        : [];
-      
-      const isOwned = bookIsbns.some(isbn => ownedIsbns.includes(isbn));
-
-      if (!isOwned && book.title) {
-        missingBooks.push({
-          title: book.title,
-          publishedDate: book.publishedDate || "Unknown",
-          isbns: bookIsbns.join(', ')
-        });
-      }
-    }
-
-    // --- NEW: HTML Formatting for Human Readability ---
-    
-    // Create the table rows from the missingBooks array
-    const tableRows = missingBooks.map(book => `
+    // --- HTML Formatting ---
+    const tableRows = missingBooksMaster.map(book => `
       <tr>
-        <td><strong>${book.title}</strong></td>
+        <td><strong>${book.author}</strong></td>
+        <td>${book.title}</td>
         <td>${book.publishedDate}</td>
         <td>${book.isbns}</td>
       </tr>
     `).join('');
 
-    // Build the final HTML page
     const htmlOutput = `
       <!DOCTYPE html>
       <html lang="en">
@@ -80,58 +85,15 @@ export default async function handler(req, res) {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Collection Gap Analysis</title>
         <style>
-          body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 1000px;
-            margin: 0 auto;
-            padding: 2rem;
-            background-color: #f9fafb;
-          }
-          .header-card {
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            margin-bottom: 20px;
-          }
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 1000px; margin: 0 auto; padding: 2rem; background-color: #f9fafb; }
+          .header-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
           h1 { margin-top: 0; color: #111; }
-          .stats {
-            display: flex;
-            gap: 20px;
-            font-size: 1.1rem;
-          }
-          .stat-box {
-            background: #eff6ff;
-            padding: 10px 20px;
-            border-radius: 6px;
-            border-left: 4px solid #3b82f6;
-          }
-          table {
-            width: 100%;
-            background: white;
-            border-collapse: collapse;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            border-radius: 8px;
-            overflow: hidden;
-          }
-          th, td {
-            padding: 12px 15px;
-            text-align: left;
-            border-bottom: 1px solid #e5e7eb;
-          }
-          th {
-            background-color: #f3f4f6;
-            font-weight: 600;
-            color: #4b5563;
-          }
+          .stats { display: flex; gap: 20px; font-size: 1.1rem; flex-wrap: wrap; }
+          .stat-box { background: #eff6ff; padding: 10px 20px; border-radius: 6px; border-left: 4px solid #3b82f6; margin-bottom: 10px; }
+          table { width: 100%; background: white; border-collapse: collapse; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-radius: 8px; overflow: hidden; }
+          th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+          th { background-color: #f3f4f6; font-weight: 600; color: #4b5563; }
           tr:hover { background-color: #f9fafb; }
-          @media print {
-            body { background: white; padding: 0; }
-            .header-card { box-shadow: none; border: 1px solid #ddd; }
-            table { box-shadow: none; border: 1px solid #ddd; }
-          }
         </style>
       </head>
       <body>
@@ -139,29 +101,29 @@ export default async function handler(req, res) {
           <h1>Collection Gap Analysis</h1>
           <div class="stats">
             <div class="stat-box"><strong>Collection Code:</strong> ${collectionCode}</div>
-            <div class="stat-box"><strong>Analyzed Author:</strong> ${author}</div>
-            <div class="stat-box"><strong>Titles Owned:</strong> ${ownedIsbns.length}</div>
-            <div class="stat-box"><strong>Missing Volumes:</strong> ${missingBooks.length}</div>
+            <div class="stat-box"><strong>Total Library Titles Owned:</strong> ${ownedIsbns.length}</div>
+            <div class="stat-box"><strong>Authors Analyzed This Run:</strong> ${Array.from(analyzedAuthors).join(', ')}</div>
+            <div class="stat-box"><strong>Missing Volumes Found:</strong> ${missingBooksMaster.length}</div>
           </div>
         </div>
 
         <table>
           <thead>
             <tr>
+              <th>Author</th>
               <th>Missing Title</th>
               <th>Publication Date</th>
               <th>ISBNs (Google Books)</th>
             </tr>
           </thead>
           <tbody>
-            ${tableRows || '<tr><td colspan="3" style="text-align:center;">No missing volumes found!</td></tr>'}
+            ${tableRows || '<tr><td colspan="4" style="text-align:center;">No missing volumes found for these authors!</td></tr>'}
           </tbody>
         </table>
       </body>
       </html>
     `;
 
-    // Tell the browser to render HTML instead of JSON
     res.setHeader('Content-Type', 'text/html');
     return res.status(200).send(htmlOutput);
 
