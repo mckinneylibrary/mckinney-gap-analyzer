@@ -1,7 +1,7 @@
 export default async function handler(req, res) {
   const collectionCode = req.query.ccode || 'YA'; 
   const offset = parseInt(req.query.offset) || 0; 
-  const batchSize = 3; // Reduced to 3 to ensure we respect Google's API speed limits
+  const batchSize = 3; 
   
   const KOHA_JSON_URL = `https://mckinney.bywatersolutions.com/cgi-bin/koha/svc/report?id=1166&sql_params=${collectionCode}`; 
 
@@ -21,13 +21,12 @@ export default async function handler(req, res) {
 
       const batchToProcess = ownedIsbns.slice(offset, offset + batchSize);
       const results = [];
-      const logs = []; // New logging system
+      const logs = []; 
 
       for (const currentIsbn of batchToProcess) {
-          // THE THROTTLE: Pause for 1 second to prevent API rate-limit blocking
+          // Pause for 1 second to respect API limits
           await new Promise(resolve => setTimeout(resolve, 1000));
 
-          // Query Google Books
           const googleBookRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${currentIsbn}`);
           const googleBookData = await googleBookRes.json();
 
@@ -42,7 +41,6 @@ export default async function handler(req, res) {
               continue;
           }
 
-          // Fetch the Author's other works
           const seriesRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=inauthor:"${author}"&maxResults=35`);
           const seriesData = await seriesRes.json();
           const seriesTitles = seriesData.items ? seriesData.items.map(item => item.volumeInfo) : [];
@@ -55,7 +53,6 @@ export default async function handler(req, res) {
               
               const isOwned = bookIsbns.some(isbn => ownedIsbns.includes(isbn));
 
-              // If it's missing, add it to our list
               if (!isOwned && book.title) {
                   results.push({
                       author: author,
@@ -94,18 +91,26 @@ export default async function handler(req, res) {
         h1 { margin-top: 0; color: #2c3e50; }
         #progress-container { background: #eee; height: 20px; border-radius: 10px; margin: 20px 0; overflow: hidden; display: none; }
         #progress-bar { background: #3498db; width: 0%; height: 100%; transition: width 0.3s; }
-        button { background: #2ecc71; color: white; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold;}
-        button:disabled { background: #95a5a6; cursor: not-allowed; }
+        button.start-btn { background: #2ecc71; color: white; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold;}
+        button.start-btn:disabled { background: #95a5a6; cursor: not-allowed; }
         .status-text { font-weight: bold; color: #7f8c8d; margin-bottom: 20px; }
         
-        /* Layout for Table and Logs */
+        /* Layout */
         .dashboard-grid { display: flex; gap: 30px; margin-top: 20px; align-items: flex-start;}
-        .table-section { flex: 2; overflow-x: auto;}
+        .results-section { flex: 2; display: flex; flex-direction: column; gap: 10px; }
         .log-section { flex: 1; background: #1e272e; color: #00d2d3; padding: 20px; border-radius: 8px; font-family: monospace; font-size: 13px; height: 600px; overflow-y: auto; box-shadow: inset 0 0 10px rgba(0,0,0,0.5);}
         
+        /* Accordion UI */
+        .accordion { background-color: #f8f9fa; color: #2c3e50; cursor: pointer; padding: 15px; width: 100%; border: 1px solid #e0e0e0; text-align: left; outline: none; font-size: 16px; font-weight: bold; border-radius: 6px; transition: 0.3s; display: flex; justify-content: space-between; align-items: center;}
+        .accordion:hover { background-color: #e9ecef; }
+        .accordion.active { background-color: #3498db; color: white; border-color: #3498db; border-bottom-left-radius: 0; border-bottom-right-radius: 0;}
+        .panel { padding: 0; background-color: white; display: none; overflow: hidden; border: 1px solid #e0e0e0; border-top: none; border-bottom-left-radius: 6px; border-bottom-right-radius: 6px; }
+        
+        /* Internal Table */
         table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #eee; }
-        th { background: #f8f9fa; position: sticky; top: 0;}
+        th, td { text-align: left; padding: 12px 15px; border-bottom: 1px solid #eee; }
+        th { background: #fbfcfc; font-size: 14px; color: #7f8c8d;}
+        tr:last-child td { border-bottom: none; }
       </style>
     </head>
     <body>
@@ -114,21 +119,15 @@ export default async function handler(req, res) {
         <p>Analyzing collection code: <strong>${collectionCode}</strong></p>
         
         <div id="controls">
-          <button id="start-btn" onclick="startAnalysis()">Start Live Scan</button>
+          <button id="start-btn" class="start-btn" onclick="startAnalysis()">Start Live Scan</button>
         </div>
 
         <div id="progress-container"><div id="progress-bar"></div></div>
         <div id="status" class="status-text">Awaiting startup...</div>
 
         <div class="dashboard-grid">
-          <div class="table-section">
-            <table id="results-table">
-              <thead>
-                <tr><th>Author</th><th>Missing Title</th><th>Year</th><th>ISBN</th></tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
+          <div class="results-section" id="results-container">
+            </div>
           
           <div class="log-section" id="live-logs">
             <span style="color: #fff;">System Logs Initialized...</span><br><br>
@@ -152,12 +151,12 @@ export default async function handler(req, res) {
         function appendLog(message) {
           const logBox = document.getElementById('live-logs');
           logBox.innerHTML += message + "<br>";
-          logBox.scrollTop = logBox.scrollHeight; // Auto-scroll to bottom
+          logBox.scrollTop = logBox.scrollHeight; 
         }
 
         async function runBatch() {
           const status = document.getElementById('status');
-          const tableBody = document.querySelector('#results-table tbody');
+          const resultsContainer = document.getElementById('results-container');
           
           try {
             const response = await fetch(\`/api/analyzer?mode=data&ccode=\${ccode}&offset=\${currentOffset}\`);
@@ -176,17 +175,57 @@ export default async function handler(req, res) {
                 data.logs.forEach(log => appendLog(log));
             }
 
-            // Append Table Results
+            // Append Grouped Results (Accordion Logic)
             if (data.results && data.results.length > 0) {
                 data.results.forEach(book => {
-                  const row = tableBody.insertRow();
-                  row.innerHTML = "<td><b>"+book.author+"</b></td><td>"+book.title+"</td><td>"+book.year+"</td><td>"+book.isbns+"</td>";
+                  // Create a safe ID string from the author's name
+                  const safeAuthorId = "group-" + book.author.replace(/[^a-zA-Z0-9]/g, "");
+                  
+                  let groupBtn = document.getElementById("btn-" + safeAuthorId);
+                  let groupPanel = document.getElementById("panel-" + safeAuthorId);
+
+                  // If this author doesn't have an accordion yet, create one
+                  if (!groupBtn) {
+                      groupBtn = document.createElement("button");
+                      groupBtn.id = "btn-" + safeAuthorId;
+                      groupBtn.className = "accordion";
+                      groupBtn.dataset.count = 0; // Keep track of missing books
+                      
+                      // Toggle functionality
+                      groupBtn.onclick = function() {
+                          this.classList.toggle("active");
+                          let panel = this.nextElementSibling;
+                          if (panel.style.display === "block") {
+                              panel.style.display = "none";
+                          } else {
+                              panel.style.display = "block";
+                          }
+                      };
+
+                      groupPanel = document.createElement("div");
+                      groupPanel.id = "panel-" + safeAuthorId;
+                      groupPanel.className = "panel";
+                      groupPanel.innerHTML = \`<table><thead><tr><th>Missing Title</th><th>Year</th><th>ISBN</th></tr></thead><tbody></tbody></table>\`;
+                      
+                      resultsContainer.appendChild(groupBtn);
+                      resultsContainer.appendChild(groupPanel);
+                  }
+
+                  // Update the button text with the new count
+                  let currentCount = parseInt(groupBtn.dataset.count) + 1;
+                  groupBtn.dataset.count = currentCount;
+                  groupBtn.innerHTML = \`<span>\${book.author}</span> <span>\${currentCount} Missing Volumes ▾</span>\`;
+
+                  // Insert the book row into this specific author's table
+                  const tbody = groupPanel.querySelector("tbody");
+                  const row = tbody.insertRow();
+                  row.innerHTML = \`<td>\${book.title}</td><td>\${book.year}</td><td>\${book.isbns}</td>\`;
                 });
             }
 
             // Loop or Finish
             if (!data.done) {
-              setTimeout(runBatch, 500); // Small pause before asking Vercel for next batch
+              setTimeout(runBatch, 500); 
             } else {
               status.innerText = "Analysis Complete! Checked " + data.total + " items.";
               status.style.color = "#27ae60";
