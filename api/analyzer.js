@@ -1,12 +1,8 @@
 export default async function handler(req, res) {
-  // Grab the collection code from the Vercel URL (defaults to YA if none provided)
   const collectionCode = req.query.ccode || 'YA'; 
-  
-  // Your specific McKinney Koha report URL, appending the required SQL parameter
   const KOHA_JSON_URL = `https://mckinney.bywatersolutions.com/cgi-bin/koha/svc/report?id=1166&sql_params=${collectionCode}`; 
   
   try {
-    // 1. Fetch the owned ISBNs from the Koha report
     const kohaResponse = await fetch(KOHA_JSON_URL);
     
     if (!kohaResponse.ok) {
@@ -15,20 +11,26 @@ export default async function handler(req, res) {
 
     const kohaData = await kohaResponse.json();
     
-    // Clean the ISBNs (remove dashes and whitespace)
-    const ownedIsbns = kohaData
-        .filter(row => row.isbn) // Ensure the row has an ISBN field
-        .map(row => row.isbn.replace(/-/g, '').trim());
+    // --- THE FIX: Parse Koha's specific Array of Arrays format ---
+    let ownedIsbns = [];
+    
+    if (kohaData.length > 1 && Array.isArray(kohaData[0])) {
+      // It's a Koha array. Skip the first row (headers) and grab the first column
+      ownedIsbns = kohaData.slice(1).map(row => {
+          const isbnStr = row[0] ? String(row[0]) : '';
+          return isbnStr.replace(/-/g, '').trim();
+      }).filter(isbn => isbn !== ''); // Remove any blanks
+    }
 
     if (!ownedIsbns.length) {
       return res.status(200).json({ 
-          message: "No ISBNs found in Koha report.", 
+          message: "Could not parse ISBNs from Koha.", 
+          raw_data_preview: kohaData.slice(0, 2), // Shows what it saw for debugging
           url_checked: KOHA_JSON_URL 
       });
     }
 
-    // 2. Process the first ISBN as a test case to establish the author/series
-    // (In a full production run, you would iterate through the ownedIsbns array)
+    // Process the first ISBN as a test case
     const testIsbn = ownedIsbns[0];
     const googleBookRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${testIsbn}`);
     const googleBookData = await googleBookRes.json();
@@ -47,20 +49,19 @@ export default async function handler(req, res) {
         return res.status(404).json({ error: "No author found for the test ISBN." });
     }
 
-    // 3. Search Google Books for other titles by this author (proxy for series completion)
+    // Search Google Books for other titles by this author
     const seriesRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=inauthor:"${author}"&maxResults=40`);
     const seriesData = await seriesRes.json();
 
     const missingBooks = [];
     const seriesTitles = seriesData.items ? seriesData.items.map(item => item.volumeInfo) : [];
 
-    // 4. The Gap Analysis: Compare API results against the Koha Owned List
+    // Compare API results against the Koha Owned List
     for (const book of seriesTitles) {
       const bookIsbns = book.industryIdentifiers 
         ? book.industryIdentifiers.map(id => id.identifier) 
         : [];
       
-      // Check if any of the Google Books ISBNs match our Koha ISBNs
       const isOwned = bookIsbns.some(isbn => ownedIsbns.includes(isbn));
 
       if (!isOwned && book.title) {
@@ -72,7 +73,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // 5. Return the final JSON payload
     return res.status(200).json({
       analyzed_collection: collectionCode,
       analyzed_author: author,
