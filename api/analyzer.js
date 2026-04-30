@@ -20,48 +20,61 @@ export default async function handler(req, res) {
       return res.status(200).send("<h1>No ISBNs found in Koha report. Check the collection code.</h1>");
     }
 
-    // --- THE UPGRADE: Batch Processing ---
-    // We will check the first 5 ISBNs to stay under Vercel's 10-second timeout.
-    // You can cautiously increase this number, but if you hit a 504 error, lower it back down.
-    const batchToProcess = ownedIsbns.slice(0, 5); 
+    // Process a safe batch of 10 books to stay under Vercel's 10-second timeout limit
+    const batchToProcess = ownedIsbns.slice(0, 10); 
     
     const missingBooksMaster = [];
-    const analyzedAuthors = new Set(); // Keeps track of authors we've already checked so we don't repeat work
+    const analyzedSeries = new Set(); 
+    let standaloneBooksSkipped = 0;
 
     for (const currentIsbn of batchToProcess) {
-        // 1. Identify the Author
-        const googleBookRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${currentIsbn}`);
-        const googleBookData = await googleBookRes.json();
+        // 1. Look up the book in the Open Library Database
+        const olRes = await fetch(`https://openlibrary.org/search.json?q=isbn:${currentIsbn}`);
+        const olData = await olRes.json();
 
-        if (!googleBookData.items || googleBookData.items.length === 0) continue; // Skip if book not found
+        if (!olData.docs || olData.docs.length === 0) continue;
 
-        const author = googleBookData.items[0].volumeInfo.authors ? googleBookData.items[0].volumeInfo.authors[0] : "";
+        const bookDoc = olData.docs[0];
+        const author = bookDoc.author_name ? bookDoc.author_name[0] : "";
+        const seriesList = bookDoc.series || [];
+
+        // 2. The Filter: If this book doesn't belong to a series, skip it entirely
+        if (!author || seriesList.length === 0) {
+            standaloneBooksSkipped++;
+            continue; 
+        }
+
+        const seriesName = seriesList[0];
         
-        // If we have no author, or we've already analyzed this author, skip to the next ISBN
-        if (!author || analyzedAuthors.has(author)) continue;
-        
-        analyzedAuthors.add(author);
+        // If we've already run a gap analysis on this series, skip to the next ISBN
+        if (analyzedSeries.has(seriesName)) continue;
+        analyzedSeries.add(seriesName);
 
-        // 2. Search for the Author's complete works
-        const seriesRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=inauthor:"${author}"&maxResults=40`);
-        const seriesData = await seriesRes.json();
+        // 3. Fetch the Author's full catalog from Open Library
+        const authorRes = await fetch(`https://openlibrary.org/search.json?author="${encodeURIComponent(author)}"&limit=150`);
+        const authorData = await authorRes.json();
+        const allAuthorBooks = authorData.docs || [];
 
-        const seriesTitles = seriesData.items ? seriesData.items.map(item => item.volumeInfo) : [];
+        // 4. Strict Series Match: Filter the catalog down to ONLY books in this exact series
+        const seriesBooks = allAuthorBooks.filter(book => {
+            return book.series && book.series.includes(seriesName);
+        });
 
-        // 3. Gap Analysis for this specific Author
-        for (const book of seriesTitles) {
-            const bookIsbns = book.industryIdentifiers 
-                ? book.industryIdentifiers.map(id => id.identifier) 
-                : [];
+        // 5. Gap Analysis
+        for (const book of seriesBooks) {
+            const bookIsbns = book.isbn || [];
+            // Clean Open Library ISBNs (remove dashes/spaces)
+            const cleanBookIsbns = bookIsbns.map(id => id.replace(/-/g, '').trim());
             
-            const isOwned = bookIsbns.some(isbn => ownedIsbns.includes(isbn));
+            const isOwned = cleanBookIsbns.some(isbn => ownedIsbns.includes(isbn));
 
             if (!isOwned && book.title) {
                 missingBooksMaster.push({
+                    series: seriesName,
                     author: author,
                     title: book.title,
-                    publishedDate: book.publishedDate || "Unknown",
-                    isbns: bookIsbns.join(', ')
+                    publishedDate: book.first_publish_year || "Unknown",
+                    isbns: cleanBookIsbns.slice(0, 2).join(', ') // Only show 2 ISBNs to keep the table tidy
                 });
             }
         }
@@ -70,8 +83,9 @@ export default async function handler(req, res) {
     // --- HTML Formatting ---
     const tableRows = missingBooksMaster.map(book => `
       <tr>
-        <td><strong>${book.author}</strong></td>
+        <td><strong>${book.series}</strong></td>
         <td>${book.title}</td>
+        <td>${book.author}</td>
         <td>${book.publishedDate}</td>
         <td>${book.isbns}</td>
       </tr>
@@ -85,7 +99,7 @@ export default async function handler(req, res) {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Collection Gap Analysis</title>
         <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 1000px; margin: 0 auto; padding: 2rem; background-color: #f9fafb; }
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 1100px; margin: 0 auto; padding: 2rem; background-color: #f9fafb; }
           .header-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
           h1 { margin-top: 0; color: #111; }
           .stats { display: flex; gap: 20px; font-size: 1.1rem; flex-wrap: wrap; }
@@ -98,26 +112,27 @@ export default async function handler(req, res) {
       </head>
       <body>
         <div class="header-card">
-          <h1>Collection Gap Analysis</h1>
+          <h1>Series Gap Analysis</h1>
           <div class="stats">
             <div class="stat-box"><strong>Collection Code:</strong> ${collectionCode}</div>
-            <div class="stat-box"><strong>Total Library Titles Owned:</strong> ${ownedIsbns.length}</div>
-            <div class="stat-box"><strong>Authors Analyzed This Run:</strong> ${Array.from(analyzedAuthors).join(', ')}</div>
-            <div class="stat-box"><strong>Missing Volumes Found:</strong> ${missingBooksMaster.length}</div>
+            <div class="stat-box"><strong>Total Library Titles Checked:</strong> ${batchToProcess.length}</div>
+            <div class="stat-box"><strong>Series Identified:</strong> ${Array.from(analyzedSeries).join(', ') || 'None found in this batch'}</div>
+            <div class="stat-box"><strong>Standalone Books Skipped:</strong> ${standaloneBooksSkipped}</div>
           </div>
         </div>
 
         <table>
           <thead>
             <tr>
-              <th>Author</th>
+              <th>Series Name</th>
               <th>Missing Title</th>
+              <th>Author</th>
               <th>Publication Date</th>
-              <th>ISBNs (Google Books)</th>
+              <th>ISBNs (Open Library)</th>
             </tr>
           </thead>
           <tbody>
-            ${tableRows || '<tr><td colspan="4" style="text-align:center;">No missing volumes found for these authors!</td></tr>'}
+            ${tableRows || '<tr><td colspan="5" style="text-align:center;">No missing series volumes found in this batch! Refresh to check more.</td></tr>'}
           </tbody>
         </table>
       </body>
